@@ -1,0 +1,6 @@
+{
+  "name": "HOS",
+  "description": "A lyrics and chords transposer for musicians, with web search and Gemini import.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
