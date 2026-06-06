@@ -12,6 +12,8 @@ import retrofit2.http.Body
 import retrofit2.http.POST
 import retrofit2.http.Query
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 @JsonClass(generateAdapter = true)
 data class GenerateContentRequest(
@@ -69,7 +71,7 @@ object RetrofitClient {
         .addLast(KotlinJsonAdapterFactory())
         .build()
 
-    private val okHttpClient = OkHttpClient.Builder()
+    val okHttpClient = OkHttpClient.Builder()
         .connectTimeout(60, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
@@ -90,23 +92,68 @@ object RetrofitClient {
 }
 
 object GeminiRepository {
+
+    private suspend fun fetchHtmlContent(url: String): String {
+        return withContext(Dispatchers.IO) {
+            try {
+                val cleanUrl = if (!url.startsWith("http://") && !url.startsWith("https://")) {
+                    "https://$url"
+                } else {
+                    url
+                }
+                val request = okhttp3.Request.Builder()
+                    .url(cleanUrl)
+                    .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+                    .addHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+                    .addHeader("Accept-Language", "en-US,en;q=0.5")
+                    .build()
+                RetrofitClient.okHttpClient.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val html = response.body?.string() ?: ""
+                        // Strip styling and scripts to reduce tokens
+                        val plainText = html
+                            .replace("<script[\\s\\S]*?>[\\s\\S]*?</script>".toRegex(), "")
+                            .replace("<style[\\s\\S]*?>[\\s\\S]*?</style>".toRegex(), "")
+                            .replace("<[^>]*>".toRegex(), " ")
+                            .replace("\\s+".toRegex(), " ")
+                        plainText.take(18000) // Get the first 18,000 characters for rich content
+                    } else {
+                        "HTTP_ERROR_${response.code}"
+                    }
+                }
+            } catch (e: Exception) {
+                "FETCH_FAILED_ERROR: ${e.message}"
+            }
+        }
+    }
+
     suspend fun fetchSongChords(query: String, searchModeUrl: Boolean = false): GeminiSongOutput? {
         val apiKey = BuildConfig.GEMINI_API_KEY
         if (apiKey.isEmpty() || apiKey == "MY_GEMINI_API_KEY") {
             throw IllegalStateException("Gemini API key is not configured. Please add your key in the Secrets panel in AI Studio.")
         }
 
-        // Formulate a robust prompt to search and structure the song.
+        var webScrapeText = ""
         val searchTypeMessage = if (searchModeUrl) {
-            "extract the lyrics and aligned chords from this web page: '$query'."
+            val isUrl = query.contains(".") || query.startsWith("http://") || query.startsWith("https://")
+            if (isUrl) {
+                webScrapeText = fetchHtmlContent(query)
+                if (webScrapeText.startsWith("HTTP_ERROR_") || webScrapeText.startsWith("FETCH_FAILED_ERROR:")) {
+                    "extract and reconstruct chords for the song/page at '$query'. (Note: Scraper failed to fetch because of browser blocks, so please rely on your vast musical knowledge of this URL or song to provide the perfect lyrics and chords)."
+                } else {
+                    "parse the scraped web content provided below and extract the lyrics and exact aligned guitar chords for the song represented at URL '$query'.\n\nSCRAPED CONTENT FROM CURRENT PAGE:\n$webScrapeText"
+                }
+            } else {
+                "find and transcribe lyrics and chords for: '$query'."
+            }
         } else {
-            "find the lyrics and aligned chords for the song: '$query'."
+            "find and structure the lyrics and perfect guitar chords for: '$query'. If this song is rare, obscure, or custom, use your advanced musicology intelligence to reconstruct its standard structure, lyrics, and typical musician chord progression."
         }
 
         val prompt = """
             Please $searchTypeMessage 
             
-            Format the response as a valid JSON object. Do not wrap the JSON output inside markdown block tags (like ```json).
+            Format the response as a solid, valid JSON object. Do not wrap the JSON output inside markdown block tags (like ```json).
             
             The JSON object MUST have exactly these property names:
             - "title": The title of the song (e.g. "Hotel California").
@@ -117,7 +164,11 @@ object GeminiRepository {
               "[Am]On a dark desert highway, [E7]cool wind in my hair
               [G]Warm smell of colitas, [D]rising up through the air"
 
-            Make sure the chords are accurate, standard musician chords (e.g. C, G, Am, F, Dm, C#m, Bb) and placed exactly where they should be played within the lyrics. Do not truncate the lyrics; provide the full song.
+            Chords Formatting Rules:
+            1. Ensure guitar chords are highly accurate, standard musician notations (e.g. C, G, Am, F, C#m, Bb, Dmaj7).
+            2. Match lyrics perfectly.
+            3. Do not truncate. Provide the full complete song, verses, chorus, bridge, and outro.
+            4. If the page is from other sites or scraping contains noise, filter it out completely and deliver only clean lyrics and chords.
         """.trimIndent()
 
         val request = GenerateContentRequest(
@@ -126,10 +177,10 @@ object GeminiRepository {
             ),
             generationConfig = GenerationConfig(
                 responseMimeType = "application/json",
-                temperature = 0.2f
+                temperature = 0.1f
             ),
             systemInstruction = Content(
-                parts = listOf(Part(text = "You are an expert musicologist, chords transcriber, and lyric extractor."))
+                parts = listOf(Part(text = "You are an expert musicologist, guitarist, and professional chord sheet editor specializing in Ultimate Guitar transcribing."))
             )
         )
 
@@ -140,9 +191,17 @@ object GeminiRepository {
             try {
                 RetrofitClient.songAdapter.fromJson(textResponse)
             } catch (e: Exception) {
-                // In case of any loose formatting or brackets, clean up and try to parse
-                val cleanedText = textResponse.trim().removeSurrounding("```json", "```").trim()
-                RetrofitClient.songAdapter.fromJson(cleanedText)
+                // Look for first '{' and last '}' in case of extra text wrappers
+                val trimmed = textResponse.trim()
+                val startIndex = trimmed.indexOf('{')
+                val endIndex = trimmed.lastIndexOf('}')
+                if (startIndex in 0 until endIndex) {
+                    val cleanedJson = trimmed.substring(startIndex, endIndex + 1)
+                    RetrofitClient.songAdapter.fromJson(cleanedJson)
+                } else {
+                    val cleanedText = trimmed.removeSurrounding("```json", "```").trim()
+                    RetrofitClient.songAdapter.fromJson(cleanedText)
+                }
             }
         } else {
             null

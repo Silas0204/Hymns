@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Exposes the external files directory (where the HOS folder resides) -->
+    <external-files-path name="external_files" path="." />
+    <!-- Exposes the internal files directory as fallback -->
+    <files-path name="internal_files" path="." />
+    <!-- Exposes temporary cache directories -->
+    <cache-path name="cache_files" path="." />
+</paths>
